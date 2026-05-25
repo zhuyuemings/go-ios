@@ -143,6 +143,7 @@ Usage:
   ios setlocationgpx [options] [--gpxfilepath=<gpxfilepath>]
   ios syslog [--parse] [options]
   ios ostrace [--pid=<processID>] [--process=<processName>] [--level=<levels>] [--subsystem=<sub>] [--match=<str>] [--exclude=<str>] [options]
+  ios perf [--bundle-id=<bundleid>] [--human-readable] [options]
   ios sysmontap [options]
   ios timeformat (24h | 12h | toggle | get) [--force] [options]
   ios tunnel ls [options]
@@ -388,6 +389,10 @@ The commands work as following:
                                                                       --subsystem=<sub>     Only show entries matching this subsystem (substring match)
                                                                       --match=<str>         Only show entries where the message contains this string
                                                                       --exclude=<str>       Hide entries where the message contains this string
+
+    ios perf [--bundle-id=<bundleid>] [--human-readable] [options]  Get system or app performance stats (FPS, CPU, Memory).
+                                                                    By default it prints continuous JSON. Use --human-readable for text output.
+
     ios sysmontap                                                   Get system stats like MEM, CPU
 
     ios timeformat (24h | 12h | toggle | get) [--force] [options]   Sets, or returns the state of the "time format".
@@ -1090,6 +1095,14 @@ The commands work as following:
 			<-c
 			log.WithFields(log.Fields{"pid": pid}).Info("stop listening to logs")
 		}
+	}
+
+	b, _ = arguments.Bool("perf")
+	if b {
+		bundleID, _ := arguments.String("--bundle-id")
+		humanReadable, _ := arguments.Bool("--human-readable")
+		runPerfCommand(device, bundleID, humanReadable)
+		return
 	}
 
 	b, _ = arguments.Bool("sysmontap")
