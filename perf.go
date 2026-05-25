@@ -15,13 +15,15 @@ import (
 )
 
 type perfJsonOutput struct {
-	Type      string   `json:"type"`
-	Timestamp int64    `json:"timestamp"`
-	BundleID  string   `json:"bundle_id,omitempty"`
-	PID       uint64   `json:"pid,omitempty"`
-	FPS       *float64 `json:"fps,omitempty"`
-	CPUUsage  *float64 `json:"cpu_usage,omitempty"`
-	MemUsage  *float64 `json:"mem_usage,omitempty"`
+	Type       string   `json:"type"`
+	Timestamp  uint64   `json:"timestamp"`
+	BundleID   string   `json:"bundle_id,omitempty"`
+	PID        uint64   `json:"pid,omitempty"`
+	FPS        *float64 `json:"fps,omitempty"`
+	CPUUsage   *float64 `json:"cpu_usage,omitempty"`
+	MemUsage   *float64 `json:"mem_usage,omitempty"`
+	NetInKbps  *float64 `json:"net_in_kbps,omitempty"`
+	NetOutKbps *float64 `json:"net_out_kbps,omitempty"`
 }
 
 func runPerfCommand(device ios.DeviceEntry, bundleID string, humanReadable bool) {
@@ -69,6 +71,18 @@ func runPerfCommand(device ios.DeviceEntry, bundleID string, humanReadable bool)
 	defer sysmon.Close()
 	sysmonChan := sysmon.ReceiveMessage()
 
+	// 1.5 Start Network Monitor
+	netMonitor, err := instruments.NewNetworkMonitorService(device)
+	if err != nil {
+		log.Fatalf("failed to start network monitor service: %v", err)
+	}
+	defer netMonitor.Close()
+	err = netMonitor.StartMonitoring()
+	if err != nil {
+		log.Fatalf("failed to start network monitoring: %v", err)
+	}
+	netAggregator := netMonitor.GetAggregator()
+
 	// 2. Start Graphics (FPS)
 	graphics, err := instruments.NewGraphicsService(device)
 	if err != nil {
@@ -80,6 +94,14 @@ func runPerfCommand(device ios.DeviceEntry, bundleID string, humanReadable bool)
 	// 3. Handle interrupts for clean shutdown
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-c
+		log.Info("shutting down perf monitoring")
+		sysmon.Close()
+		netMonitor.Close()
+		graphics.Close()
+		os.Exit(0)
+	}()
 
 	if humanReadable {
 		fmt.Printf("Starting performance monitoring... (Target: %s)\n", bundleID)
@@ -87,13 +109,21 @@ func runPerfCommand(device ios.DeviceEntry, bundleID string, humanReadable bool)
 		fmt.Println("-----------------------------------------------------------------------")
 	}
 
+	var (
+		firstNet = true
+		lastNetIn, lastNetOut, lastTs uint64
+	)
+	
 	for {
 		select {
 		case msg, ok := <-sysmonChan:
 			if !ok {
 				return
 			}
-			ts := time.Now().UnixMilli()
+			ts := uint64(time.Now().UnixMilli())
+			if msg.EndMachAbsTime > 0 {
+				ts = msg.EndMachAbsTime
+			}
 
 			var cpu float64
 			var mem uint64
@@ -114,9 +144,6 @@ func runPerfCommand(device ios.DeviceEntry, bundleID string, humanReadable bool)
 					totalMem += procData.PhysFootprint
 				}
 
-				// SystemMemory mapping could have precise global values,
-				// but summing all PhysFootprint offers a solid approximation for "used memory"
-				// across all active processes.
 				if sysMem, ok := msg.SystemMemory["phys_footprint"]; ok {
 					if v, valid := instruments.ToUint64(sysMem); valid {
 						totalMem = v
@@ -140,28 +167,72 @@ func runPerfCommand(device ios.DeviceEntry, bundleID string, humanReadable bool)
 			cpu = math.Round(cpu*100) / 100
 
 			var memUsage float64
-			var memSize uint64
+			var physMemSize uint64
 			if sizeVal, ok := msg.SystemMemory["mem_size"]; ok {
 				if v, valid := instruments.ToUint64(sizeVal); valid {
-					memSize = v
+					physMemSize = v
 				}
 			}
-			if memSize > 0 {
-				memUsage = (float64(mem) / float64(memSize)) * 100.0
+			if physMemSize > 0 {
+				memUsage = (float64(mem) / float64(physMemSize)) * 100.0
+				if memUsage > 100.0 {
+					memUsage = 100.0
+				}
 				memUsage = math.Round(memUsage*100) / 100
 			}
+
+			var netInPtr, netOutPtr *float64
 
 			if humanReadable {
 				memMB := float64(mem) / 1024 / 1024
 				fmt.Printf("%-20s %-10s %-15.2f %-15.2f %-10s\n", time.Now().Format("15:04:05.000"), "SYSMON", cpu, memMB, "-")
 			} else {
+				// Query NetworkMonitorAggregator for pure network bytes!
+				netInBytes, netOutBytes := netAggregator.GetNetworkBytes(targetPID)
+
+				var deltaNetIn, deltaNetOut uint64
+				if firstNet {
+					firstNet = false
+					deltaNetIn = 0
+					deltaNetOut = 0
+				} else {
+					if netInBytes >= lastNetIn {
+						deltaNetIn = netInBytes - lastNetIn
+					}
+					if netOutBytes >= lastNetOut {
+						deltaNetOut = netOutBytes - lastNetOut
+					}
+				}
+
+				var netInKbps, netOutKbps float64
+				if !firstNet && lastTs > 0 {
+					deltaMs := ts - lastTs
+					if deltaMs > 0 {
+						if deltaNetIn > 0 {
+							netInKbps = math.Round((float64(deltaNetIn)/1024.0)/(float64(deltaMs)/1000.0)*100) / 100
+						}
+						if deltaNetOut > 0 {
+							netOutKbps = math.Round((float64(deltaNetOut)/1024.0)/(float64(deltaMs)/1000.0)*100) / 100
+						}
+					}
+				}
+
+				lastNetIn = netInBytes
+				lastNetOut = netOutBytes
+				lastTs = uint64(ts)
+
+				if netInKbps > 0 { netInPtr = &netInKbps }
+				if netOutKbps > 0 { netOutPtr = &netOutKbps }
+
 				out := perfJsonOutput{
-					Type:      "sysmon",
-					Timestamp: ts,
-					BundleID:  bundleID,
-					PID:       targetPID,
-					CPUUsage:  &cpu,
-					MemUsage:  &memUsage,
+					Type:       "sysmon",
+					Timestamp:  ts,
+					BundleID:   bundleID,
+					PID:        targetPID,
+					CPUUsage:   &cpu,
+					MemUsage:   &memUsage,
+					NetInKbps:  netInPtr,
+					NetOutKbps: netOutPtr,
 				}
 				printJSON(out)
 			}
@@ -170,7 +241,7 @@ func runPerfCommand(device ios.DeviceEntry, bundleID string, humanReadable bool)
 			if !ok {
 				return
 			}
-			ts := time.Now().UnixMilli()
+			ts := uint64(time.Now().UnixMilli())
 
 			if humanReadable {
 				fmt.Printf("%-20s %-10s %-15s %-15s %-10.2f\n", time.Now().Format("15:04:05.000"), "FPS", "-", "-", fpsMsg.FPS)
