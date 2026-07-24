@@ -54,6 +54,12 @@ func New(device ios.DeviceEntry) (*Connection, error) {
 	return &Connection{deviceConn: deviceConn, plistCodec: ios.NewPlistCodec()}, nil
 }
 
+// NewFromConn creates a Connection from an existing DeviceConnectionInterface.
+// This allows callers to establish the connection externally (e.g. via shared lockdown session).
+func NewFromConn(conn ios.DeviceConnectionInterface) *Connection {
+	return &Connection{deviceConn: conn, plistCodec: ios.NewPlistCodec()}
+}
+
 func (conn *Connection) BrowseUserApps() ([]AppInfo, error) {
 	return conn.browseApps(browseApps("User", true))
 }
@@ -105,7 +111,28 @@ func (c *Connection) Uninstall(bundleId string) error {
 		"ApplicationIdentifier": bundleId,
 		"ClientOptions":         options,
 	}
-	b, err := c.plistCodec.Encode(uninstallCommand)
+	return c.sendCommandAndWait(uninstallCommand)
+}
+
+// Install sends an Install command to installationproxy for a package that has
+// already been staged on the device (e.g. via AFC to PublicStaging/).
+// packagePath is the device-local path such as "PublicStaging/bundleID".
+// bundleID is optional; if non-empty, it is passed as CFBundleIdentifier in ClientOptions.
+func (c *Connection) Install(packagePath string, bundleID string) error {
+	opts := map[string]interface{}{}
+	if bundleID != "" {
+		opts["CFBundleIdentifier"] = bundleID
+	}
+	installCommand := map[string]interface{}{
+		"Command":       "Install",
+		"PackagePath":   packagePath,
+		"ClientOptions": opts,
+	}
+	return c.sendCommandAndWait(installCommand)
+}
+
+func (c *Connection) sendCommandAndWait(command map[string]interface{}) error {
+	b, err := c.plistCodec.Encode(command)
 	if err != nil {
 		return err
 	}
@@ -134,14 +161,22 @@ func (c *Connection) Uninstall(bundleId string) error {
 
 func checkFinished(dict map[string]interface{}) (bool, error) {
 	if val, ok := dict["Error"]; ok {
-		return true, fmt.Errorf("received uninstall error: %v", val)
+		errMsg := fmt.Sprintf("%v", val)
+		if desc, ok := dict["ErrorDescription"]; ok {
+			errMsg = fmt.Sprintf("%s: %v", errMsg, desc)
+		}
+		if detail, ok := dict["ErrorDetail"]; ok {
+			errMsg = fmt.Sprintf("%s (error code: %v)", errMsg, detail)
+		}
+		return true, fmt.Errorf("install failed: %s", errMsg)
 	}
 	if val, ok := dict["Status"]; ok {
 		if "Complete" == val {
-			log.Info("done uninstalling")
+			log.Info("operation completed successfully")
 			return true, nil
 		}
-		log.Infof("uninstall status: %s", val)
+		percent, _ := dict["PercentComplete"]
+		log.WithFields(log.Fields{"status": val, "percentComplete": percent}).Info("installing")
 		return false, nil
 	}
 	return true, fmt.Errorf("unknown status update: %+v", dict)

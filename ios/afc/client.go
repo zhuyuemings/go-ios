@@ -156,30 +156,27 @@ func (c *Client) remove(p string, recursive bool) error {
 func (c *Client) sendPacket(operation opcode, headerPayload []byte, payload []byte) error {
 	num := c.packetNum.Add(1)
 
-	thisLen := headerSize + uint64(len(headerPayload))
-	p := packet{
-		Header: header{
-			Magic:     magic,
-			EntireLen: thisLen + uint64(len(payload)),
-			ThisLen:   thisLen,
-			PacketNum: uint64(num),
-			Operation: operation,
-		},
-		HeaderPayload: headerPayload,
-		Payload:       payload,
-	}
+	hpLen := len(headerPayload)
+	pLen := len(payload)
+	thisLen := headerSize + uint64(hpLen)
+	entireLen := thisLen + uint64(pLen)
 
-	err := binary.Write(c.connection, binary.LittleEndian, p.Header)
+	// Encode header + headerPayload into one small buffer (avoids reflection
+	// and merges two tiny writes). Payload is written directly without copy.
+	hdr := make([]byte, int(headerSize)+hpLen)
+	binary.LittleEndian.PutUint64(hdr[0:], magic)
+	binary.LittleEndian.PutUint64(hdr[8:], entireLen)
+	binary.LittleEndian.PutUint64(hdr[16:], thisLen)
+	binary.LittleEndian.PutUint64(hdr[24:], uint64(num))
+	binary.LittleEndian.PutUint64(hdr[32:], uint64(operation))
+	if hpLen > 0 {
+		copy(hdr[headerSize:], headerPayload)
+	}
+	_, err := c.connection.Write(hdr)
 	if err != nil {
 		return fmt.Errorf("error writing header: %w", err)
 	}
-	if len(headerPayload) > 0 {
-		_, err = c.connection.Write(headerPayload)
-		if err != nil {
-			return fmt.Errorf("error writing header payload: %w", err)
-		}
-	}
-	if len(payload) > 0 {
+	if pLen > 0 {
 		_, err = c.connection.Write(payload)
 		if err != nil {
 			return fmt.Errorf("error writing payload: %w", err)
@@ -189,11 +186,20 @@ func (c *Client) sendPacket(operation opcode, headerPayload []byte, payload []by
 }
 
 func (c *Client) readPacket() (packet, error) {
-	var h header
-	err := binary.Read(c.connection, binary.LittleEndian, &h)
+	// Read header manually to avoid binary.Read reflection overhead
+	hdrBuf := make([]byte, headerSize)
+	_, err := io.ReadFull(c.connection, hdrBuf)
 	if err != nil {
 		return packet{}, fmt.Errorf("error reading header: %w", err)
 	}
+	h := header{
+		Magic:     binary.LittleEndian.Uint64(hdrBuf[0:]),
+		EntireLen: binary.LittleEndian.Uint64(hdrBuf[8:]),
+		ThisLen:   binary.LittleEndian.Uint64(hdrBuf[16:]),
+		PacketNum: binary.LittleEndian.Uint64(hdrBuf[24:]),
+		Operation: opcode(binary.LittleEndian.Uint64(hdrBuf[32:])),
+	}
+
 	headerPayloadLen := h.ThisLen - headerSize
 	payloadLen := h.EntireLen - h.ThisLen
 
@@ -209,7 +215,7 @@ func (c *Client) readPacket() (packet, error) {
 	if headerPayloadLen > 0 {
 		_, err = io.ReadFull(c.connection, headerpayload)
 		if err != nil {
-			return packet{}, fmt.Errorf("error reading header: %w", err)
+			return packet{}, fmt.Errorf("error reading header payload: %w", err)
 		}
 	}
 	if payloadLen > 0 {

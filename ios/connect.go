@@ -97,11 +97,22 @@ func ConnectToService(device DeviceEntry, serviceName string) (DeviceConnectionI
 		return nil, err
 	}
 
+	return connectToServicePort(device.DeviceID, startServiceResponse, pairRecord)
+}
+
+// ConnectToServiceWithResponse connects to a device service using a pre-obtained
+// StartServiceResponse and PairRecord. This allows callers to start multiple services
+// from a single lockdown session and then connect to each without repeating the handshake.
+func ConnectToServiceWithResponse(deviceID int, resp StartServiceResponse, pairRecord PairRecord) (DeviceConnectionInterface, error) {
+	return connectToServicePort(deviceID, resp, pairRecord)
+}
+
+func connectToServicePort(deviceID int, resp StartServiceResponse, pairRecord PairRecord) (DeviceConnectionInterface, error) {
 	muxConn, err := NewUsbMuxConnectionSimple()
 	if err != nil {
 		return nil, fmt.Errorf("Could not connect to usbmuxd socket, is it running? %w", err)
 	}
-	err = muxConn.connectWithStartServiceResponse(device.DeviceID, startServiceResponse, pairRecord)
+	err = muxConn.connectWithStartServiceResponse(deviceID, resp, pairRecord)
 	if err != nil {
 		return nil, err
 	}

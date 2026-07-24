@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bufio"
 	"bytes"
 	"context"
@@ -272,7 +273,7 @@ The commands work as following:
 
     ios image unmount [options]                     Unmount developer disk image
     ios info [display | lockdown] [options]         Prints a dump of device information from the given source.
-    ios install --path=<ipaOrAppFolder> [options]   Specify a .app folder or an installable ipa file that will be installed.
+    ios install --path=<ipaOrAppFolder> [--afc] [options]   Specify a .app folder or an installable ipa file that will be installed.
     ios instruments notifications [options]         Listen to application state notifications
 
     ios ip [options]                                Uses the live pcap iOS packet capture to wait until it finds one that contains the IP address of the device.
@@ -697,7 +698,12 @@ The commands work as following:
 	b, _ = arguments.Bool("install")
 	if b {
 		path, _ := arguments.String("--path")
-		installApp(device, path)
+		afc, _ := arguments.Bool("--afc")
+		if afc {
+			installViaAfc(device, path)
+		} else {
+			installApp(device, path)
+		}
 		return
 	}
 
@@ -2025,6 +2031,103 @@ func installApp(device ios.DeviceEntry, path string) {
 	exitIfError("failed connecting to zipconduit, dev image installed?", err)
 	err = conn.SendFile(path)
 	exitIfError("failed writing", err)
+}
+
+func installViaAfc(device ios.DeviceEntry, ipaPath string) {
+	// Extract bundleID from IPA
+	bundleID := extractBundleID(ipaPath)
+	log.Infof("detected bundle ID: %s", bundleID)
+
+	// Single lockdown session to start both services
+	lockdown, err := ios.ConnectLockdownWithSession(device)
+	exitIfError("failed connecting to lockdown", err)
+
+	instproxyResp, err := lockdown.StartService("com.apple.mobile.installation_proxy")
+	exitIfError("failed starting installationproxy", err)
+
+	afcResp, err := lockdown.StartService("com.apple.afc")
+	exitIfError("failed starting AFC", err)
+
+	lockdown.Close() // no longer needed
+
+	pairRecord, err := ios.ReadPairRecord(device.Properties.SerialNumber)
+	exitIfError("failed reading pair record", err)
+
+	// Connect to installationproxy
+	instproxyConn, err := ios.ConnectToServiceWithResponse(device.DeviceID, instproxyResp, pairRecord)
+	exitIfError("failed connecting to installationproxy", err)
+	svc := installationproxy.NewFromConn(instproxyConn)
+	defer svc.Close()
+
+	// Connect to AFC
+	afcDevConn, err := ios.ConnectToServiceWithResponse(device.DeviceID, afcResp, pairRecord)
+	exitIfError("failed connecting to AFC", err)
+	afcConn := afc.NewFromConn(afcDevConn)
+	defer afcConn.Close()
+
+	// Upload IPA to device
+	stagingDir := "PublicStaging"
+	_ = afcConn.MkDir(stagingDir)
+
+	remotePath := stagingDir + "/" + bundleID
+	log.Infof("uploading %s to device:%s", ipaPath, remotePath)
+	err = pushLargeFile(afcConn, ipaPath, remotePath)
+	exitIfError("failed uploading IPA via AFC", err)
+	log.Info("upload complete")
+
+	// Install
+	err = svc.Install(remotePath, bundleID)
+	exitIfError("failed installing via installationproxy", err)
+
+	// Clean up
+	_ = afcConn.Remove(remotePath)
+}
+
+// extractBundleID reads CFBundleIdentifier from the Info.plist inside an IPA file.
+func extractBundleID(ipaPath string) string {
+	r, err := zip.OpenReader(ipaPath)
+	exitIfError("failed opening IPA", err)
+	defer r.Close()
+
+	for _, f := range r.File {
+		// Info.plist is at Payload/<AppName>.app/Info.plist
+		if !strings.HasPrefix(f.Name, "Payload/") || !strings.HasSuffix(f.Name, ".app/Info.plist") {
+			continue
+		}
+		rc, err := f.Open()
+		exitIfError("failed reading Info.plist from IPA", err)
+		data, err := io.ReadAll(rc)
+		rc.Close()
+		exitIfError("failed reading Info.plist", err)
+
+		info, err := ios.ParsePlist(data)
+		exitIfError("failed parsing Info.plist", err)
+
+		if bid, ok := info["CFBundleIdentifier"].(string); ok {
+			return bid
+		}
+	}
+	log.Fatal("could not find CFBundleIdentifier in IPA")
+	return ""
+}
+
+// pushLargeFile uploads a file via AFC using a 2MB buffer to minimize round-trip overhead.
+func pushLargeFile(afcConn *afc.Client, localPath, remotePath string) error {
+	f, err := os.Open(localPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	fd, err := afcConn.Open(remotePath, afc.WRITE_ONLY_CREATE_TRUNC)
+	if err != nil {
+		return err
+	}
+	defer fd.Close()
+
+	buf := make([]byte, 2<<20) // 2MB buffer
+	_, err = io.CopyBuffer(fd, f, buf)
+	return err
 }
 
 func uninstallApp(device ios.DeviceEntry, bundleId string) {
